@@ -1,0 +1,102 @@
+name: Build APK from ZIP
+
+on:
+  push:
+    paths:
+      - '*.zip'
+  workflow_dispatch:
+    inputs:
+      zip_name:
+        description: 'Zip ka naam (khali chhodo = latest zip)'
+        required: false
+        default: ''
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-apk
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Latest zip dhundo
+        id: pick
+        env:
+          INPUT_ZIP: ${{ github.event.inputs.zip_name }}
+        run: |
+          latest="$INPUT_ZIP"
+          if [ -z "$latest" ]; then
+            best=0
+            for f in *.zip; do
+              [ -f "$f" ] || continue
+              t=$(git log -1 --format=%ct -- "$f")
+              t=${t:-0}
+              if [ "$t" -ge "$best" ]; then best=$t; latest="$f"; fi
+            done
+          fi
+          if [ -z "$latest" ] || [ ! -f "$latest" ]; then
+            echo "Root me koi zip nahi mili"; exit 1
+          fi
+          echo "Selected zip: $latest"
+          echo "name=$latest" >> "$GITHUB_OUTPUT"
+          echo "base=${latest%.zip}" >> "$GITHUB_OUTPUT"
+
+      - name: Zip extract karo
+        id: extract
+        env:
+          ZIP: ${{ steps.pick.outputs.name }}
+        run: |
+          rm -rf _build && mkdir _build
+          unzip -q "$ZIP" -d _build
+          s=$(find _build -maxdepth 4 \( -name settings.gradle.kts -o -name settings.gradle \) -not -path '*/__MACOSX/*' | head -n 1)
+          if [ -z "$s" ]; then echo "settings.gradle nahi mili"; exit 1; fi
+          echo "Project folder: $(dirname "$s")"
+          echo "dir=$(dirname "$s")" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 8.7
+
+      - name: APK build karo
+        working-directory: ${{ steps.extract.outputs.dir }}
+        run: |
+          if [ -f gradlew ]; then
+            chmod +x gradlew
+            ./gradlew assembleDebug --no-daemon --stacktrace
+          else
+            gradle assembleDebug --no-daemon --stacktrace
+          fi
+
+      - name: APK collect karo
+        env:
+          DIR: ${{ steps.extract.outputs.dir }}
+          BASE: ${{ steps.pick.outputs.base }}
+        run: |
+          apk=$(find "$DIR" -path '*outputs/apk/debug/*.apk' | head -n 1)
+          if [ -z "$apk" ]; then echo "APK nahi mili"; exit 1; fi
+          mkdir -p dist
+          cp "$apk" "dist/$BASE.apk"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.pick.outputs.base }}-apk
+          path: dist/*.apk
+
+      - name: Release banao (phone se seedha download)
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: build-${{ github.run_number }}
+          name: ${{ steps.pick.outputs.base }} (build ${{ github.run_number }})
+          files: dist/*.apk
