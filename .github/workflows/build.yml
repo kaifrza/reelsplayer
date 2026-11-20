@@ -22,7 +22,7 @@ jobs:
   build:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           fetch-depth: 0
 
@@ -42,7 +42,8 @@ jobs:
             done
           fi
           if [ -z "$latest" ] || [ ! -f "$latest" ]; then
-            echo "Root me koi zip nahi mili"; exit 1
+            echo "::error title=Zip nahi mili::Repo ke root me koi .zip file nahi mili"
+            exit 1
           fi
           echo "Selected zip: $latest"
           echo "name=$latest" >> "$GITHUB_OUTPUT"
@@ -54,30 +55,83 @@ jobs:
           ZIP: ${{ steps.pick.outputs.name }}
         run: |
           rm -rf _build && mkdir _build
-          unzip -q "$ZIP" -d _build
+          if ! unzip -q "$ZIP" -d _build; then
+            echo "::error title=Zip extract fail::$ZIP kharab hai ya khul nahi rahi"
+            exit 1
+          fi
           s=$(find _build -maxdepth 4 \( -name settings.gradle.kts -o -name settings.gradle \) -not -path '*/__MACOSX/*' | head -n 1)
-          if [ -z "$s" ]; then echo "settings.gradle nahi mili"; exit 1; fi
+          if [ -z "$s" ]; then
+            echo "::error title=Project nahi mila::$ZIP ke andar settings.gradle(.kts) nahi hai"
+            exit 1
+          fi
           echo "Project folder: $(dirname "$s")"
           echo "dir=$(dirname "$s")" >> "$GITHUB_OUTPUT"
 
-      - uses: actions/setup-java@v4
+      - uses: actions/setup-java@v5
         with:
           distribution: temurin
           java-version: 17
 
-      - uses: gradle/actions/setup-gradle@v4
+      - uses: gradle/actions/setup-gradle@v5
         with:
           gradle-version: 8.7
 
       - name: APK build karo
+        id: build
+        continue-on-error: true
+        shell: bash
         working-directory: ${{ steps.extract.outputs.dir }}
         run: |
           if [ -f gradlew ]; then
             chmod +x gradlew
-            ./gradlew assembleDebug --no-daemon --stacktrace
+            ./gradlew assembleDebug --no-daemon --stacktrace --console=plain 2>&1 | tee "$GITHUB_WORKSPACE/build.log"
           else
-            gradle assembleDebug --no-daemon --stacktrace
+            gradle assembleDebug --no-daemon --stacktrace --console=plain 2>&1 | tee "$GITHUB_WORKSPACE/build.log"
           fi
+
+      - name: Fail ka reason nikalo
+        if: steps.build.outcome == 'failure'
+        env:
+          ZIP: ${{ steps.pick.outputs.name }}
+        run: |
+          set +e
+          R=error_report.txt
+          {
+            echo "Zip: $ZIP"
+            echo
+            echo "--- Compile errors ---"
+            grep -E '^e: |error: ' build.log | sed -E 's#file://[^ ]*/(app/src)#\1#' | awk '!seen[$0]++' | head -n 30
+            echo
+            echo "--- Gradle reason ---"
+            grep -m1 -A10 'What went wrong' build.log
+            echo
+            echo "--- Last 25 lines ---"
+            tail -n 25 build.log
+          } > "$R"
+          echo "=================== BUILD FAIL: YE COPY KARKE BHEJO ==================="
+          cat "$R"
+          echo "======================================================================="
+          {
+            echo '## ❌ Build fail - ye copy karke bhejo'
+            echo '```'
+            cat "$R"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          MSG=$(head -c 3500 "$R" | sed ':a;N;$!ba;s/%/%25/g;s/\r//g;s/\n/%0A/g')
+          echo "::error title=Build fail ka reason::$MSG"
+
+      - name: Full log save karo
+        if: steps.build.outcome == 'failure'
+        uses: actions/upload-artifact@v6
+        with:
+          name: build-log
+          path: |
+            build.log
+            error_report.txt
+
+      - name: Job ko fail mark karo
+        if: steps.build.outcome == 'failure'
+        run: exit 1
 
       - name: APK collect karo
         env:
@@ -85,18 +139,27 @@ jobs:
           BASE: ${{ steps.pick.outputs.base }}
         run: |
           apk=$(find "$DIR" -path '*outputs/apk/debug/*.apk' | head -n 1)
-          if [ -z "$apk" ]; then echo "APK nahi mili"; exit 1; fi
+          if [ -z "$apk" ]; then
+            echo "::error title=APK nahi mili::Build chala par debug APK output me nahi mili"
+            exit 1
+          fi
           mkdir -p dist
           cp "$apk" "dist/$BASE.apk"
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v6
         with:
           name: ${{ steps.pick.outputs.base }}-apk
           path: dist/*.apk
 
-      - name: Release banao (phone se seedha download)
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: build-${{ github.run_number }}
-          name: ${{ steps.pick.outputs.base }} (build ${{ github.run_number }})
-          files: dist/*.apk
+      - name: Release banao
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BASE: ${{ steps.pick.outputs.base }}
+        run: |
+          TAG="build-${{ github.run_number }}"
+          gh release create "$TAG" "dist/$BASE.apk" \
+            --target "$GITHUB_SHA" \
+            --title "$BASE (build ${{ github.run_number }})" \
+            --notes "Built from $BASE.zip"
+          echo "### ✅ APK ready" >> "$GITHUB_STEP_SUMMARY"
+          echo "${{ github.server_url }}/${{ github.repository }}/releases/tag/$TAG" >> "$GITHUB_STEP_SUMMARY"
