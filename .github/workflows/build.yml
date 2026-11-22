@@ -67,6 +67,40 @@ jobs:
           echo "Project folder: $(dirname "$s")"
           echo "dir=$(dirname "$s")" >> "$GITHUB_OUTPUT"
 
+      - name: Error report helper
+        run: |
+          cat > "$RUNNER_TEMP/report.sh" <<'EOS'
+          set +e
+          LOG="$1"; TITLE="$2"; LEVEL="$3"
+          R="$(mktemp)"
+          {
+            echo "Zip: $ZIP"
+            echo
+            echo "--- Compile errors ---"
+            grep -E '^e: |error: ' "$LOG" | sed -E 's#file://[^ ]*/(app/src)#\1#' | awk '!seen[$0]++' | head -n 30
+            echo
+            echo "--- Gradle reason ---"
+            grep -m1 -A10 'What went wrong' "$LOG"
+            echo
+            echo "--- R8 / resources ---"
+            grep -E 'R8:|Missing class|AAPT|ERROR:' "$LOG" | awk '!seen[$0]++' | head -n 15
+            echo
+            echo "--- Last 25 lines ---"
+            tail -n 25 "$LOG"
+          } > "$R"
+          echo "=================== $TITLE: YE COPY KARKE BHEJO ==================="
+          cat "$R"
+          echo "======================================================================="
+          {
+            echo "## $TITLE - ye copy karke bhejo"
+            echo '```'
+            cat "$R"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          MSG=$(head -c 3500 "$R" | sed ':a;N;$!ba;s/%/%25/g;s/\r//g;s/\n/%0A/g')
+          echo "::$LEVEL title=$TITLE::$MSG"
+          EOS
+
       - uses: actions/setup-java@v5
         with:
           distribution: temurin
@@ -76,75 +110,76 @@ jobs:
         with:
           gradle-version: 8.7
 
-      - name: APK build karo
-        id: build
+      - name: Release APK build karo (fast + optimized)
+        id: build_release
         continue-on-error: true
         shell: bash
         working-directory: ${{ steps.extract.outputs.dir }}
         run: |
           if [ -f gradlew ]; then
             chmod +x gradlew
-            ./gradlew assembleDebug --no-daemon --stacktrace --console=plain 2>&1 | tee "$GITHUB_WORKSPACE/build.log"
+            ./gradlew assembleRelease --no-daemon --stacktrace --console=plain 2>&1 | tee "$GITHUB_WORKSPACE/build_release.log"
           else
-            gradle assembleDebug --no-daemon --stacktrace --console=plain 2>&1 | tee "$GITHUB_WORKSPACE/build.log"
+            gradle assembleRelease --no-daemon --stacktrace --console=plain 2>&1 | tee "$GITHUB_WORKSPACE/build_release.log"
           fi
 
-      - name: Fail ka reason nikalo
-        if: steps.build.outcome == 'failure'
+      - name: Release fail hua - reason
+        if: steps.build_release.outcome == 'failure'
         env:
           ZIP: ${{ steps.pick.outputs.name }}
-        run: |
-          set +e
-          R=error_report.txt
-          {
-            echo "Zip: $ZIP"
-            echo
-            echo "--- Compile errors ---"
-            grep -E '^e: |error: ' build.log | sed -E 's#file://[^ ]*/(app/src)#\1#' | awk '!seen[$0]++' | head -n 30
-            echo
-            echo "--- Gradle reason ---"
-            grep -m1 -A10 'What went wrong' build.log
-            echo
-            echo "--- Last 25 lines ---"
-            tail -n 25 build.log
-          } > "$R"
-          echo "=================== BUILD FAIL: YE COPY KARKE BHEJO ==================="
-          cat "$R"
-          echo "======================================================================="
-          {
-            echo '## ❌ Build fail - ye copy karke bhejo'
-            echo '```'
-            cat "$R"
-            echo '```'
-          } >> "$GITHUB_STEP_SUMMARY"
-          MSG=$(head -c 3500 "$R" | sed ':a;N;$!ba;s/%/%25/g;s/\r//g;s/\n/%0A/g')
-          echo "::error title=Build fail ka reason::$MSG"
+        run: bash "$RUNNER_TEMP/report.sh" build_release.log "Release build fail (debug se chala raha hoon)" warning
 
-      - name: Full log save karo
-        if: steps.build.outcome == 'failure'
+      - name: Debug APK fallback
+        id: build_debug
+        if: steps.build_release.outcome == 'failure'
+        continue-on-error: true
+        shell: bash
+        working-directory: ${{ steps.extract.outputs.dir }}
+        run: |
+          if [ -f gradlew ]; then
+            ./gradlew assembleDebug --no-daemon --stacktrace --console=plain 2>&1 | tee "$GITHUB_WORKSPACE/build_debug.log"
+          else
+            gradle assembleDebug --no-daemon --stacktrace --console=plain 2>&1 | tee "$GITHUB_WORKSPACE/build_debug.log"
+          fi
+
+      - name: Debug bhi fail - reason
+        if: steps.build_debug.outcome == 'failure'
+        env:
+          ZIP: ${{ steps.pick.outputs.name }}
+        run: bash "$RUNNER_TEMP/report.sh" build_debug.log "Build fail" error
+
+      - name: Logs save karo
+        if: steps.build_release.outcome == 'failure'
         uses: actions/upload-artifact@v6
         with:
-          name: build-log
+          name: build-logs
           path: |
-            build.log
-            error_report.txt
+            build_release.log
+            build_debug.log
 
       - name: Job ko fail mark karo
-        if: steps.build.outcome == 'failure'
+        if: steps.build_debug.outcome == 'failure'
         run: exit 1
 
       - name: APK collect karo
+        id: collect
         env:
           DIR: ${{ steps.extract.outputs.dir }}
           BASE: ${{ steps.pick.outputs.base }}
         run: |
-          apk=$(find "$DIR" -path '*outputs/apk/debug/*.apk' | head -n 1)
+          kind=release
+          apk=$(find "$DIR" -path '*outputs/apk/release/*.apk' | head -n 1)
           if [ -z "$apk" ]; then
-            echo "::error title=APK nahi mili::Build chala par debug APK output me nahi mili"
+            kind=debug
+            apk=$(find "$DIR" -path '*outputs/apk/debug/*.apk' | head -n 1)
+          fi
+          if [ -z "$apk" ]; then
+            echo "::error title=APK nahi mili::Build chala par APK output me nahi mili"
             exit 1
           fi
           mkdir -p dist
           cp "$apk" "dist/$BASE.apk"
+          echo "kind=$kind" >> "$GITHUB_OUTPUT"
 
       - uses: actions/upload-artifact@v6
         with:
@@ -155,11 +190,12 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           BASE: ${{ steps.pick.outputs.base }}
+          KIND: ${{ steps.collect.outputs.kind }}
         run: |
           TAG="build-${{ github.run_number }}"
           gh release create "$TAG" "dist/$BASE.apk" \
             --target "$GITHUB_SHA" \
-            --title "$BASE (build ${{ github.run_number }})" \
-            --notes "Built from $BASE.zip"
-          echo "### ✅ APK ready" >> "$GITHUB_STEP_SUMMARY"
+            --title "$BASE (build ${{ github.run_number }}, $KIND)" \
+            --notes "Built from $BASE.zip ($KIND build)"
+          echo "### ✅ APK ready ($KIND build)" >> "$GITHUB_STEP_SUMMARY"
           echo "${{ github.server_url }}/${{ github.repository }}/releases/tag/$TAG" >> "$GITHUB_STEP_SUMMARY"
